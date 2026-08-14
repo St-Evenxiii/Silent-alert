@@ -1,0 +1,5 @@
+Reference,Value,Footprint,Quantity
+U1,LD2410C,Connector_PinHeader_1x05,1
+U2,MAX3485E,Package_DIP:DIP-8_W7.62mm,1
+U3,LD1117S33TR_SOT223,Package_TO_SOT_SMD:SOT-223-3_TabPin2,1
+J1,Sensor_Terminal,TerminalBlock_Phoenix_MKDS-1,5-4-5.08,1

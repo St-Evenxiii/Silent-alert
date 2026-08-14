@@ -1,0 +1,9 @@
+Reference,Value,Footprint,Quantity
+U1,ESP32-DevKitV1,Module:ESP32_DevKit_V1_30Pin,1
+U2,MAX3485E,Package_DIP:DIP-8_W7.62mm,1
+J1,LM2596_Buck_Module,Connector_PinHeader_1x04,1
+J2,TP5100_Charger_Module,Connector_PinHeader_1x04,1
+J3,2S_BMS_Module,Connector_PinHeader_1x06,1
+J4,Batt_Terminal,TerminalBlock_Phoenix_MKDS-1,5-2-5.08,1
+J5,Sensor_Terminal,TerminalBlock_Phoenix_MKDS-1,5-4-5.08,1
+J6,LED_Terminal,TerminalBlock_Phoenix_MKDS-1,5-3-5.08,1
