@@ -28,16 +28,20 @@ const byte FRAME_TAIL[]   = {0xF8, 0xF7, 0xF6, 0xF5};
 byte buffer[MAX_BUFFER_SIZE];
 int bufferIndex = 0;
 
+// Clear the display if no valid radar frame arrives for this long
+#define RADAR_TIMEOUT_MS 1000
+
 // Current state
 float currentDistance = -1; // -1 means no presence
 bool isPresent = false;
 unsigned long lastDisplayUpdate = 0;
+unsigned long lastFrameTime = 0;
 
 // --- Function Prototypes ---
+void feedRadarByte(byte b);
 void processRadarData(byte* frameBuffer, int length);
 void updateDisplay();
 uint32_t colorWheel(byte WheelPos);
-void shiftBufferDown(int shiftAmount);
 
 void setup() {
   Serial.begin(115200); // Debug serial
@@ -54,106 +58,108 @@ void setup() {
 }
 
 void loop() {
-  // Read incoming data from RS-485 (LD2410C)
+  // Read incoming bytes from the LD2410C (via the RS-485 link) and feed the
+  // frame parser one byte at a time.
   while (RadarSerial.available()) {
-    byte b = RadarSerial.read();
-
-    // Prevent buffer overflow
-    if (bufferIndex >= MAX_BUFFER_SIZE) {
-      shiftBufferDown(1);
-    }
-
-    buffer[bufferIndex++] = b;
-
-    // We need at least the length of a header to start checking
-    if (bufferIndex >= 4) {
-        // If the start of our buffer doesn't match the header, we are out of sync.
-        while (bufferIndex > 0 &&
-               !(buffer[0] == FRAME_HEADER[0] &&
-                 (bufferIndex < 2 || buffer[1] == FRAME_HEADER[1]) &&
-                 (bufferIndex < 3 || buffer[2] == FRAME_HEADER[2]) &&
-                 (bufferIndex < 4 || buffer[3] == FRAME_HEADER[3]))) {
-
-            shiftBufferDown(1);
-        }
-    }
-
-    // Now, if our buffer starts with a valid header and we have enough bytes for a tail
-    if (bufferIndex >= 8 &&
-        buffer[0] == FRAME_HEADER[0] && buffer[1] == FRAME_HEADER[1] &&
-        buffer[2] == FRAME_HEADER[2] && buffer[3] == FRAME_HEADER[3]) {
-
-        // Look for the tail at the end of our current buffer
-        if (buffer[bufferIndex-4] == FRAME_TAIL[0] &&
-            buffer[bufferIndex-3] == FRAME_TAIL[1] &&
-            buffer[bufferIndex-2] == FRAME_TAIL[2] &&
-            buffer[bufferIndex-1] == FRAME_TAIL[3]) {
-
-            // We found a complete frame!
-            processRadarData(buffer, bufferIndex);
-
-            // Reset buffer to start accumulating the next frame
-            bufferIndex = 0;
-        }
-    }
+    feedRadarByte((byte)RadarSerial.read());
   }
 
-  // Non-blocking update display
+  // If the radar stops talking (cable unplugged, sensor reset...) don't leave
+  // the LEDs frozen on the last reading.
+  if (isPresent && millis() - lastFrameTime > RADAR_TIMEOUT_MS) {
+    isPresent = false;
+    currentDistance = -1;
+  }
+
+  // Non-blocking display update
   if (millis() - lastDisplayUpdate >= 20) {
     updateDisplay();
     lastDisplayUpdate = millis();
   }
 }
 
-void shiftBufferDown(int shiftAmount) {
-    if (shiftAmount >= bufferIndex) {
-        bufferIndex = 0;
-        return;
+// LD2410C report frame layout:
+//   F4 F3 F2 F1 | len_lo len_hi | <len bytes of payload> | F8 F7 F6 F5
+// The length field tells us exactly where the frame ends, which is much more
+// robust than searching for the tail bytes (they can appear inside the payload).
+void feedRadarByte(byte b) {
+  if (bufferIndex < 4) {
+    // Still looking for the 4-byte header.
+    if (b == FRAME_HEADER[bufferIndex]) {
+      buffer[bufferIndex++] = b;
+    } else {
+      // Restart; the byte may itself be the first header byte.
+      bufferIndex = (b == FRAME_HEADER[0]) ? 1 : 0;
+      if (bufferIndex) buffer[0] = b;
     }
-    for (int i = 0; i < bufferIndex - shiftAmount; i++) {
-        buffer[i] = buffer[i + shiftAmount];
-    }
-    bufferIndex -= shiftAmount;
+    return;
+  }
+
+  buffer[bufferIndex++] = b;
+
+  if (bufferIndex < 6) return; // waiting for the length field
+
+  int payloadLen = buffer[4] | (buffer[5] << 8);
+  int frameLen = 4 + 2 + payloadLen + 4;
+
+  if (payloadLen <= 0 || frameLen > MAX_BUFFER_SIZE) {
+    bufferIndex = 0; // corrupt length, resync
+    return;
+  }
+
+  if (bufferIndex < frameLen) return; // keep accumulating
+
+  // Full frame received: validate the tail before using it.
+  if (buffer[frameLen - 4] == FRAME_TAIL[0] &&
+      buffer[frameLen - 3] == FRAME_TAIL[1] &&
+      buffer[frameLen - 2] == FRAME_TAIL[2] &&
+      buffer[frameLen - 1] == FRAME_TAIL[3]) {
+    processRadarData(buffer, frameLen);
+  }
+  bufferIndex = 0;
 }
 
 void processRadarData(byte* frameBuffer, int length) {
-  // LD2410C Engineering Mode or Basic Mode parsing.
+  // Payload (starting at index 6):
+  //   [6]  data type   0x02 = basic mode, 0x01 = engineering mode
+  //   [7]  0xAA        intra-frame head
+  //   [8]  target state 0x00 none, 0x01 moving, 0x02 static, 0x03 both
+  //   [9..10]  moving target distance (cm, little endian)
+  //   [11]     moving target energy
+  //   [12..13] stationary target distance (cm)
+  //   [14]     stationary target energy
+  //   [15..16] detection distance (cm)
+  // A basic-mode frame is 23 bytes; engineering mode frames are longer but
+  // start with the same fields, so both are handled here.
+  if (length < 23) return;
+  if (frameBuffer[6] != 0x01 && frameBuffer[6] != 0x02) return;
+  if (frameBuffer[7] != 0xAA) return;
 
-  // Ensure we have enough data for a basic mode frame which is exactly 23 bytes.
-  if (length < 23) {
+  lastFrameTime = millis();
+
+  byte targetState = frameBuffer[8];
+  int moveDist   = frameBuffer[9]  | (frameBuffer[10] << 8);
+  int staticDist = frameBuffer[12] | (frameBuffer[13] << 8);
+
+  switch (targetState) {
+    case 0x01: // moving
+      currentDistance = moveDist;
+      break;
+    case 0x02: // stationary
+      currentDistance = staticDist;
+      break;
+    case 0x03: // both: use whichever is closer
+      currentDistance = min(moveDist, staticDist);
+      if (currentDistance <= 0) currentDistance = max(moveDist, staticDist);
+      break;
+    default:   // 0x00 no target (or unknown)
+      isPresent = false;
+      currentDistance = -1;
       return;
   }
 
-  // Data starts at index 6 (Header(4) + Length(2))
-  // Index 6 is intra-frame head (0xAA or 0xAB)
-  // Index 7 is data type
-  if (frameBuffer[7] == 0x00 || frameBuffer[7] == 0x01 || frameBuffer[7] == 0x02) {
-
-    // Target state is at index 8
-    // 0x00: No target, 0x01: Moving target, 0x02: Static target, 0x03: Moving and static
-    byte targetState = frameBuffer[8];
-
-    if (targetState == 0x00) {
-      isPresent = false;
-      currentDistance = -1;
-    } else {
-      isPresent = true;
-
-      // Moving distance is at index 9, 10
-      int moveDist = frameBuffer[9] | (frameBuffer[10] << 8); // in cm
-      // Static distance is at index 12, 13
-      int staticDist = frameBuffer[12] | (frameBuffer[13] << 8); // in cm
-
-      if (targetState == 0x01 || targetState == 0x03) {
-        currentDistance = moveDist;
-      } else if (targetState == 0x02) {
-        currentDistance = staticDist;
-      }
-
-      // Sanity check, ignore crazy values
-      if(currentDistance > 1000) currentDistance = 1000;
-    }
-  }
+  isPresent = currentDistance > 0;
+  if (currentDistance > 1000) currentDistance = 1000; // sanity clamp
 }
 
 void updateDisplay() {
@@ -167,11 +173,11 @@ void updateDisplay() {
   float dist = constrain(currentDistance, MIN_DISTANCE_CM, MAX_DISTANCE_CM);
 
   // Closer = more LEDs. Farther = fewer LEDs.
-  int ledsToLight = map(dist, MAX_DISTANCE_CM, MIN_DISTANCE_CM, 1, NUM_LEDS);
+  int ledsToLight = map((long)dist, (long)MAX_DISTANCE_CM, (long)MIN_DISTANCE_CM, 1, NUM_LEDS);
   ledsToLight = constrain(ledsToLight, 1, NUM_LEDS);
 
   // We want Blue for far, Red for close.
-  int colorVal = map(dist, MIN_DISTANCE_CM, MAX_DISTANCE_CM, 0, 170);
+  int colorVal = map((long)dist, (long)MIN_DISTANCE_CM, (long)MAX_DISTANCE_CM, 0, 170);
   colorVal = constrain(colorVal, 0, 170);
 
   uint32_t activeColor = colorWheel(colorVal);
